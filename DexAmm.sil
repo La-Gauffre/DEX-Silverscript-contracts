@@ -1,0 +1,454 @@
+pragma silverscript ^0.1.0;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DexAmm — core of a KAS / KCC20 pool (option A: LP supply pre-minted in a vault)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ⚠️ AI-GENERATED FIRST DRAFT — NOT AUDITED, NOT FOR PRODUCTION. See README.md.
+//
+// Components of a pool (see README.md):
+//
+//   DexAmm       (this contract) central state, owns both vaults
+//   DexKasPool   its value = the KAS reserve
+//   DexDeposit   deposit logic    (checks EVERYTHING during a deposit)
+//   DexWithdraw  withdrawal logic (checks EVERYTHING during a withdrawal)
+//   token vault  KCC20 UTXO of the traded token, owner = DexAmm (0x04), borrow off
+//   LP vault     KCC20 UTXO of the LP token (whole supply), owner = DexAmm, borrow off
+//
+// Entrypoints:
+//
+//   init       once only: links DexKasPool / DexDeposit / DexWithdraw (created
+//              in the same transaction, already pointing at this AMM) and
+//              checks that the WHOLE LP supply is minted into the LP vault.
+//   swap       KAS ⇄ token. Checks everything itself. LP vault, Deposit and
+//              Withdraw are forbidden.
+//   liquidity  requires EXACTLY ONE module (Deposit XOR Withdraw) and delegates
+//              the economics to it. Only checks that the configuration is frozen.
+//
+// KCC20 releases both vaults as soon as DexAmm is an input: every entrypoint
+// either constrains them or forbids them.
+//
+// ⚠️ The order and types of the state fields below are copied into `AmmState`
+//    in DexDeposit.sil and DexWithdraw.sil. Any change must be mirrored there
+//    exactly (positional encoding).
+// ═════════════════════════════════════════════════════════════════════════════
+
+contract DexAmm(
+    // ── Parameters SHARED by all pools (compiled into the code) ──
+    // The LP token has a fixed type chosen by the DEX: its KCC20 and
+    // PublicMint templates are identical for every pool.
+    int lp_prefix_len,
+    int lp_suffix_len,
+    byte[32] lp_hash,
+    int pm_prefix_len,
+    int pm_suffix_len,
+    byte[32] pm_hash,
+    int fee_bps,
+
+    // ── Pool-SPECIFIC parameters (initial state) ──
+    byte[32] init_token_id,
+    byte[32] init_lp_token_id,
+    byte[32] init_modules_hash,
+    int init_token_prefix_len,
+    int init_token_suffix_len,
+    byte[32] init_token_hash,
+    int init_lp_total
+) {
+    // ── State ──────────────────────────────────────────────────────────────
+    bool initialized = false;
+
+    byte[32] token_id = init_token_id;          // covenant id of the traded token
+    byte[32] lp_token_id = init_lp_token_id;    // covenant id of the LP token
+
+    // Links set by `init` (zero before).
+    byte[32] kas_pool_id = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+    byte[32] deposit_id = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+    byte[32] withdraw_id = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+
+    // blake3(kas_pool_hash ‖ deposit_hash ‖ withdraw_hash): expected templates
+    // of the three modules, checked by `init`.
+    byte[32] modules_hash = init_modules_hash;
+
+    // KCC20 template of the traded token (depends on its type:
+    // MAX_DELEGATES / MAX_TOKEN_OUTPUTS).
+    int token_prefix_len = init_token_prefix_len;
+    int token_suffix_len = init_token_suffix_len;
+    byte[32] token_hash = init_token_hash;
+
+    // Accounting.
+    int reserve_token = 0;                      // exact balance of the token vault
+    int lp_vault = init_lp_total;               // exact balance of the LP vault
+    int lp_supply = 0;                          // LP issued (circulating + MIN_LIQUIDITY)
+
+    // ── Foreign layouts ────────────────────────────────────────────────────
+
+    // KCC20 (DEX/kcc20.sil): generated field first, then declared fields.
+    struct KCC20State {
+        byte[32] kcc20_template;
+        int amount;
+        byte[32] owner;
+        byte owner_scheme;
+        byte borrow_scheme;
+        byte[32] borrow_guard;
+        byte[32] extension_commitment;
+    }
+
+    // PublicMint (DEX/mint.sil): two generated fields, then declared fields.
+    struct PublicMintState {
+        byte[32] kcc20_template;
+        byte[32] public_mint_template;
+        int remaining;
+        int mint_amount;
+        pubkey owner;
+        byte[32] extension_commitment;
+    }
+
+    // Common state of DexKasPool, DexDeposit and DexWithdraw.
+    struct ModuleState {
+        byte[32] amm_id;
+    }
+
+    // ── Constants ──────────────────────────────────────────────────────────
+    byte constant OWNER_COVENANT_ID = 0x04;
+    byte constant BORROW_DISABLED = 0x00;
+    byte[32] constant ZERO32 = byte[32](0x0000000000000000000000000000000000000000000000000000000000000000);
+
+    // ≥ 1 + MAX_DELEGATES of the largest supported KCC20 type.
+    int constant MAX_KCC20_SCAN = 10;
+
+    int constant BPS = 10000;
+    int constant TWO31 = 2147483648;
+    int constant TWO62 = 4611686018427387904;
+
+    // ═════════════════════════════════════════════════════════════════════
+    // 128-bit arithmetic
+    // ═════════════════════════════════════════════════════════════════════
+
+    // a·b = hi·2^62 + lo, 0 ≤ lo < 2^62. Requires 0 ≤ a, b < 2^62.
+    // Bounds (B = 2^31): p0 < 2^62, p1 < 2^63, p2 < 2^62,
+    // p0 + (p1 % B)·B < 2^63: no int64 overflow.
+    function mul128(int a, int b) : (int, int) {
+        require(a >= 0);
+        require(b >= 0);
+        require(a < TWO62);
+        require(b < TWO62);
+
+        int a1 = a / TWO31;
+        int a0 = a % TWO31;
+        int b1 = b / TWO31;
+        int b0 = b % TWO31;
+
+        int p0 = a0 * b0;
+        int p1 = a1 * b0 + a0 * b1;
+        int p2 = a1 * b1;
+
+        int lo = p0 + (p1 % TWO31) * TWO31;
+        int hi = p2 + p1 / TWO31 + lo / TWO62;
+        lo = lo % TWO62;
+        return (hi, lo);
+    }
+
+    // require(a·b ≤ c·d), exact.
+    function requireMulLe(int a, int b, int c, int d) {
+        (int h1, int l1) = mul128(a, b);
+        (int h2, int l2) = mul128(c, d);
+        require(h1 < h2 || (h1 == h2 && l1 <= l2));
+    }
+
+    // ceil(x · bps / 10000) without overflow.
+    function feeOn(int x, int bps) : int {
+        require(x >= 0);
+        int f = (x / BPS) * bps + ((x % BPS) * bps + BPS - 1) / BPS;
+        return f;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Vaults
+    // ═════════════════════════════════════════════════════════════════════
+
+    // EXHAUSTIVE scan of the inputs of covenant `token`: number of UTXOs owned
+    // by `owner` and index of the last one found. Every input of this covenant
+    // must use the KCC20 template (a PublicMint of the same token would make
+    // the read fail: it must not be part of a DEX transaction).
+    function scanOwned(byte[32] token, byte[32] owner, int pl, int sl, byte[32] h) : (int, int) {
+        int total = OpCovInputCount(token);
+        require(total <= MAX_KCC20_SCAN);
+
+        int count = 0;
+        int found = 0;
+        for (n, 0, total, MAX_KCC20_SCAN) {
+            int idx = OpCovInputIdx(token, n);
+            KCC20State c = readInputStateWithTemplate(idx, pl, sl, h);
+            if (c.owner == owner && c.owner_scheme == OWNER_COVENANT_ID) {
+                count = count + 1;
+                found = idx;
+            }
+        }
+        return (count, found);
+    }
+
+    // Identifies THE vault of `token` (unique, balance = expected, borrow off)
+    // and checks its continuation at `out_idx` with balance `next_amount`.
+    function checkVault(
+        byte[32] token,
+        byte[32] owner,
+        int pl,
+        int sl,
+        byte[32] h,
+        int expected,
+        int next_amount,
+        int out_idx
+    ) {
+        (int count, int vidx) = scanOwned(token, owner, pl, sl, h);
+        require(count == 1);
+
+        KCC20State v = readInputStateWithTemplate(vidx, pl, sl, h);
+        require(v.amount == expected);
+        require(v.borrow_scheme == BORROW_DISABLED);
+
+        require(next_amount >= 0);
+        KCC20State nv = KCC20State {
+            kcc20_template: h,
+            amount: next_amount,
+            owner: owner,
+            owner_scheme: OWNER_COVENANT_ID,
+            borrow_scheme: BORROW_DISABLED,
+            borrow_guard: v.borrow_guard,
+            extension_commitment: v.extension_commitment
+        };
+        validateOutputStateWithInputTemplate(out_idx, nv, vidx, pl, sl, h);
+        require(OpOutputCovenantId(out_idx) == token);
+        require(tx.outputs[out_idx].value >= tx.inputs[vidx].value);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // State invariants
+    // ═════════════════════════════════════════════════════════════════════
+
+    // Configuration, frozen forever.
+    function checkConfig(State prev, State next) {
+        require(next.token_id == prev.token_id);
+        require(next.lp_token_id == prev.lp_token_id);
+        require(next.modules_hash == prev.modules_hash);
+        require(next.token_prefix_len == prev.token_prefix_len);
+        require(next.token_suffix_len == prev.token_suffix_len);
+        require(next.token_hash == prev.token_hash);
+    }
+
+    // Links, frozen after `init`.
+    function checkLinks(State prev, State next) {
+        require(prev.initialized);
+        require(next.initialized);
+        require(next.kas_pool_id == prev.kas_pool_id);
+        require(next.deposit_id == prev.deposit_id);
+        require(next.withdraw_id == prev.withdraw_id);
+    }
+
+    // The AMM keeps at least its dust.
+    function checkSelfValue() {
+        require(tx.outputs[OpAuthOutputIdx(this.activeInputIndex, 0)].value
+            >= tx.inputs[this.activeInputIndex].value);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // INIT — once only
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    // Transaction:
+    //   inputs  : DexAmm (not initialized), PublicMint of the LP token
+    //             (remaining == lp_total), funding inputs
+    //   outputs : DexAmm', DexKasPool, DexDeposit, DexWithdraw (geneses
+    //             authorized by the funding inputs, state
+    //             { amm_id = this AMM }), PublicMint LP' (remaining = 0),
+    //             LP vault (lp_total, owner = this AMM)
+    //
+    // The template prefixes / suffixes of the modules and of the LP KCC20 are
+    // passed as arguments: they are checked against the hashes frozen in state.
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function init(
+        State prev,
+        State[] newStates,
+        int kas_pool_out,
+        int deposit_out,
+        int withdraw_out,
+        int pm_in,
+        byte[32] kas_pool_hash,
+        byte[32] deposit_hash,
+        byte[32] withdraw_hash,
+        byte[] kas_pool_prefix,
+        byte[] kas_pool_suffix,
+        byte[] deposit_prefix,
+        byte[] deposit_suffix,
+        byte[] withdraw_prefix,
+        byte[] withdraw_suffix,
+        byte[] lp_prefix,
+        byte[] lp_suffix
+    ) {
+        require(newStates.length == 1);
+        State next = newStates[0];
+
+        require(!prev.initialized);
+        require(next.initialized);
+        checkConfig(prev, next);
+        checkSelfValue();
+
+        require(prev.token_id != prev.lp_token_id);
+        require(fee_bps >= 0);
+        require(fee_bps < BPS);
+        require(prev.lp_vault > 0);
+
+        // Accounting starts from zero.
+        require(next.reserve_token == 0);
+        require(next.lp_vault == prev.lp_vault);
+        require(next.lp_supply == 0);
+
+        byte[32] myCovId = OpInputCovenantId(this.activeInputIndex);
+        ModuleState linked = ModuleState { amm_id: myCovId };
+
+        // ── Modules: right template, pointing at this AMM ──
+        require(blake3(byte[](kas_pool_hash) + byte[](deposit_hash) + byte[](withdraw_hash)) == prev.modules_hash);
+        validateOutputStateWithTemplate(kas_pool_out, linked, kas_pool_prefix, kas_pool_suffix, kas_pool_hash);
+        validateOutputStateWithTemplate(deposit_out, linked, deposit_prefix, deposit_suffix, deposit_hash);
+        validateOutputStateWithTemplate(withdraw_out, linked, withdraw_prefix, withdraw_suffix, withdraw_hash);
+
+        byte[32] kp_id = OpOutputCovenantId(kas_pool_out);
+        byte[32] dep_id = OpOutputCovenantId(deposit_out);
+        byte[32] wd_id = OpOutputCovenantId(withdraw_out);
+        require(kp_id != dep_id);
+        require(kp_id != wd_id);
+        require(dep_id != wd_id);
+        // NB: no OpCovOutputCount here. GENESIS outputs are not registered in
+        // the script engine's covenant context (only the VM recomputes their
+        // KIP-20 id): OpCovOutputCount(genesis) does not see them. A genesis
+        // group with several outputs would only create duplicates of the same
+        // module, which `groups = single` and the `dep + wd == 1` check of
+        // `liquidity` make unusable together.
+
+        require(next.kas_pool_id == kp_id);
+        require(next.deposit_id == dep_id);
+        require(next.withdraw_id == wd_id);
+
+        // ── LP supply: EVERYTHING is minted into the LP vault ──
+        //
+        // The LP PublicMint is spent through `mint`: continuation at
+        // auth-output 0, KCC20 recipient at auth-output 1.
+        // remaining == lp_total on input and 0 on output: no LP can ever be
+        // minted from this PublicMint again (a `split` would leave
+        // remaining ≥ half, so that path is excluded).
+        require(OpInputCovenantId(pm_in) == prev.lp_token_id);
+        PublicMintState pm = readInputStateWithTemplate(pm_in, pm_prefix_len, pm_suffix_len, pm_hash);
+        require(pm.kcc20_template == lp_hash);
+        require(pm.remaining == prev.lp_vault);
+
+        PublicMintState pm_next = PublicMintState {
+            kcc20_template: pm.kcc20_template,
+            public_mint_template: pm.public_mint_template,
+            remaining: 0,
+            mint_amount: pm.mint_amount,
+            owner: pm.owner,
+            extension_commitment: pm.extension_commitment
+        };
+        validateOutputStateWithInputTemplate(
+            OpAuthOutputIdx(pm_in, 0),
+            pm_next,
+            pm_in,
+            pm_prefix_len,
+            pm_suffix_len,
+            pm_hash
+        );
+
+        int lp_out = OpAuthOutputIdx(pm_in, 1);
+        KCC20State lp_vault_state = KCC20State {
+            kcc20_template: lp_hash,
+            amount: prev.lp_vault,
+            owner: myCovId,
+            owner_scheme: OWNER_COVENANT_ID,
+            borrow_scheme: BORROW_DISABLED,
+            borrow_guard: ZERO32,
+            extension_commitment: pm.extension_commitment
+        };
+        validateOutputStateWithTemplate(lp_out, lp_vault_state, lp_prefix, lp_suffix, lp_hash);
+        require(OpOutputCovenantId(lp_out) == prev.lp_token_id);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // SWAP — KAS ⇄ token
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    //   (K' − fee(ΔK⁺)) · (T' − fee(ΔT⁺)) ≥ K · T
+    //
+    // K = value of DexKasPool, T = reserve_token. Fees stay in the pool
+    // (they reward the LPs).
+    //
+    // Transaction (buy):
+    //   inputs  : DexAmm, DexKasPool, token vault, KAS wallet
+    //   outputs : DexAmm', DexKasPool' (K + Δ), token vault' (T − x),
+    //             buyer's tokens, KAS change
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function swap(State prev, State[] newStates, int token_vault_out) {
+        require(newStates.length == 1);
+        State next = newStates[0];
+
+        checkConfig(prev, next);
+        checkLinks(prev, next);
+        checkSelfValue();
+
+        require(next.lp_vault == prev.lp_vault);
+        require(next.lp_supply == prev.lp_supply);
+        require(prev.lp_supply > 0);
+
+        // No liquidity module.
+        require(OpCovInputCount(prev.deposit_id) == 0);
+        require(OpCovInputCount(prev.withdraw_id) == 0);
+
+        // The LP vault must not move: it would be released unchecked.
+        // Simpler and cheaper than a scan: no LP input at all.
+        require(OpCovInputCount(prev.lp_token_id) == 0);
+
+        // Token reserve: vault identity + continuation.
+        checkVault(
+            prev.token_id, OpInputCovenantId(this.activeInputIndex),
+            prev.token_prefix_len, prev.token_suffix_len, prev.token_hash,
+            prev.reserve_token, next.reserve_token, token_vault_out
+        );
+        require(next.reserve_token > 0);
+
+        // KAS reserve.
+        require(OpCovInputCount(prev.kas_pool_id) == 1);
+        require(OpCovOutputCount(prev.kas_pool_id) == 1);
+        int k_in = tx.inputs[OpCovInputIdx(prev.kas_pool_id, 0)].value;
+        int k_out = tx.outputs[OpCovOutputIdx(prev.kas_pool_id, 0)].value;
+        require(k_out > 0);
+
+        // Reserves adjusted for fees (taken on what goes IN).
+        int k_adj = k_out > k_in ? k_out - feeOn(k_out - k_in, fee_bps) : k_out;
+        int t_adj = next.reserve_token > prev.reserve_token
+            ? next.reserve_token - feeOn(next.reserve_token - prev.reserve_token, fee_bps)
+            : next.reserve_token;
+        require(k_adj > 0);
+        require(t_adj > 0);
+
+        requireMulLe(k_in, prev.reserve_token, k_adj, t_adj);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // LIQUIDITY — delegation to DexDeposit XOR DexWithdraw
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    // The present module reads this AMM's input state, validates its output
+    // state, and checks both vaults, the KAS reserve and the formula.
+    // Here: only the configuration and the links.
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function liquidity(State prev, State[] newStates) {
+        require(newStates.length == 1);
+        State next = newStates[0];
+
+        checkConfig(prev, next);
+        checkLinks(prev, next);
+        checkSelfValue();
+
+        int dep = OpCovInputCount(prev.deposit_id);
+        int wd = OpCovInputCount(prev.withdraw_id);
+        require(dep + wd == 1);
+    }
+}

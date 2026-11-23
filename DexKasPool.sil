@@ -1,0 +1,33 @@
+pragma silverscript ^0.1.0;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DexKasPool — KAS reserve of a DEX pool
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ⚠️ AI-GENERATED FIRST DRAFT — NOT AUDITED, NOT FOR PRODUCTION. See README.md.
+//
+// The VALUE of this UTXO is the pool's KAS reserve. Its covenant id is unique
+// (KIP-20 lineage), so it cannot be forged.
+//
+// This covenant ONLY checks its own structure:
+//   * the AMM of its pool is present in the transaction;
+//   * it recreates itself as exactly one continuation, with the same state.
+//
+// Its output value is checked by whoever carries the economics of the
+// operation: DexAmm.swap for a swap, DexDeposit / DexWithdraw for liquidity.
+// It is created, already linked to the AMM, in the AMM's `init` transaction,
+// which checks its template and state.
+// ═════════════════════════════════════════════════════════════════════════════
+
+contract DexKasPool(byte[32] init_amm_id) {
+    byte[32] amm_id = init_amm_id;   // covenant id of the AMM, frozen forever
+
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function spend(State prev, State[] newStates) {
+        require(newStates.length == 1);
+        require(newStates[0].amm_id == prev.amm_id);
+
+        // Only the AMM of this pool can move the reserve.
+        require(OpCovInputCount(prev.amm_id) == 1);
+    }
+}

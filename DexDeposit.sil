@@ -1,0 +1,273 @@
+pragma silverscript ^0.1.0;
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DexDeposit — liquidity deposit module of a DEX pool
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ⚠️ AI-GENERATED FIRST DRAFT — NOT AUDITED, NOT FOR PRODUCTION. See README.md.
+//
+// ONE single spending path (`deposit`): the mere presence of this covenant
+// therefore guarantees that the logic below runs. DexAmm.liquidity relies on
+// that guarantee to delegate the economics.
+//
+// This module checks EVERYTHING during a deposit:
+//   * the AMM present is the one of this pool AND it designates us (deposit_id);
+//   * DexWithdraw is absent;
+//   * the AMM output state: configuration and links unchanged,
+//     accounting = values checked here;
+//   * the token vault and the LP vault (identity + continuation);
+//   * the KAS reserve (DexKasPool);
+//   * the liquidity formula.
+//
+//   dk = K' − K       KAS added to DexKasPool
+//   dt = T' − T       tokens added to the token vault
+//   dl = V − V'       LP taken out of the LP vault (to the depositor)
+//
+//   First deposit (L = 0) : (dl + MIN_LIQUIDITY)² ≤ dk · dt
+//                           L' = dl + MIN_LIQUIDITY
+//   Later deposits        : dl · K ≤ dk · L  and  dl · T ≤ dt · L
+//                           L' = L + dl
+//
+// Transaction:
+//   inputs  : DexAmm (liquidity), DexKasPool, DexDeposit, token vault,
+//             depositor's tokens, LP vault, KAS wallet
+//   outputs : DexAmm', DexKasPool' (K + dk), DexDeposit', token vault' (T + dt),
+//             token change, LP vault' (V − dl), depositor's LP (dl), KAS change
+// ═════════════════════════════════════════════════════════════════════════════
+
+contract DexDeposit(
+    // ── SHARED parameters (compiled into the code) ──
+    // DexAmm template: DexAmm does not hold this module's hash in its CODE
+    // (only in its state), so there is no circular dependency.
+    int amm_prefix_len,
+    int amm_suffix_len,
+    byte[32] amm_hash,
+    // KCC20 template of the LP token (fixed type chosen by the DEX).
+    int lp_prefix_len,
+    int lp_suffix_len,
+    byte[32] lp_hash,
+
+    // ── Pool-specific ──
+    byte[32] init_amm_id
+) {
+    byte[32] amm_id = init_amm_id;   // covenant id of the AMM, frozen forever
+
+    // ⚠️ EXACT copy of DexAmm's state (order and types): positional encoding.
+    struct AmmState {
+        bool initialized;
+        byte[32] token_id;
+        byte[32] lp_token_id;
+        byte[32] kas_pool_id;
+        byte[32] deposit_id;
+        byte[32] withdraw_id;
+        byte[32] modules_hash;
+        int token_prefix_len;
+        int token_suffix_len;
+        byte[32] token_hash;
+        int reserve_token;
+        int lp_vault;
+        int lp_supply;
+    }
+
+    // KCC20 (DEX/kcc20.sil): generated field first, then declared fields.
+    struct KCC20State {
+        byte[32] kcc20_template;
+        int amount;
+        byte[32] owner;
+        byte owner_scheme;
+        byte borrow_scheme;
+        byte[32] borrow_guard;
+        byte[32] extension_commitment;
+    }
+
+    byte constant OWNER_COVENANT_ID = 0x04;
+    byte constant BORROW_DISABLED = 0x00;
+
+    // ≥ 1 + MAX_DELEGATES of the largest supported KCC20 type (same value as DexAmm).
+    int constant MAX_KCC20_SCAN = 10;
+
+    // LP locked forever by the first deposit (share-price inflation defence).
+    int constant MIN_LIQUIDITY = 1000;
+
+    int constant TWO31 = 2147483648;
+    int constant TWO62 = 4611686018427387904;
+
+    // ═════════════════════════════════════════════════════════════════════
+    // 128-bit arithmetic
+    // ═════════════════════════════════════════════════════════════════════
+
+    // a·b = hi·2^62 + lo, 0 ≤ lo < 2^62. Requires 0 ≤ a, b < 2^62.
+    // Bounds (B = 2^31): p0 < 2^62, p1 < 2^63, p2 < 2^62,
+    // p0 + (p1 % B)·B < 2^63: no int64 overflow.
+    function mul128(int a, int b) : (int, int) {
+        require(a >= 0);
+        require(b >= 0);
+        require(a < TWO62);
+        require(b < TWO62);
+
+        int a1 = a / TWO31;
+        int a0 = a % TWO31;
+        int b1 = b / TWO31;
+        int b0 = b % TWO31;
+
+        int p0 = a0 * b0;
+        int p1 = a1 * b0 + a0 * b1;
+        int p2 = a1 * b1;
+
+        int lo = p0 + (p1 % TWO31) * TWO31;
+        int hi = p2 + p1 / TWO31 + lo / TWO62;
+        lo = lo % TWO62;
+        return (hi, lo);
+    }
+
+    // require(a·b ≤ c·d), exact.
+    function requireMulLe(int a, int b, int c, int d) {
+        (int h1, int l1) = mul128(a, b);
+        (int h2, int l2) = mul128(c, d);
+        require(h1 < h2 || (h1 == h2 && l1 <= l2));
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Vaults
+    // ═════════════════════════════════════════════════════════════════════
+
+    // EXHAUSTIVE scan of the inputs of covenant `token`: number of UTXOs owned
+    // by `owner` and index of the last one found. Every input of this covenant
+    // must use the KCC20 template (a PublicMint of the same token would make
+    // the read fail: it must not be part of a DEX transaction).
+    function scanOwned(byte[32] token, byte[32] owner, int pl, int sl, byte[32] h) : (int, int) {
+        int total = OpCovInputCount(token);
+        require(total <= MAX_KCC20_SCAN);
+
+        int count = 0;
+        int found = 0;
+        for (n, 0, total, MAX_KCC20_SCAN) {
+            int idx = OpCovInputIdx(token, n);
+            KCC20State c = readInputStateWithTemplate(idx, pl, sl, h);
+            if (c.owner == owner && c.owner_scheme == OWNER_COVENANT_ID) {
+                count = count + 1;
+                found = idx;
+            }
+        }
+        return (count, found);
+    }
+
+    // Identifies THE vault of `token` (unique, balance = expected, borrow off)
+    // and checks its continuation at `out_idx` with balance `next_amount`.
+    function checkVault(
+        byte[32] token,
+        byte[32] owner,
+        int pl,
+        int sl,
+        byte[32] h,
+        int expected,
+        int next_amount,
+        int out_idx
+    ) {
+        (int count, int vidx) = scanOwned(token, owner, pl, sl, h);
+        require(count == 1);
+
+        KCC20State v = readInputStateWithTemplate(vidx, pl, sl, h);
+        require(v.amount == expected);
+        require(v.borrow_scheme == BORROW_DISABLED);
+
+        require(next_amount >= 0);
+        KCC20State nv = KCC20State {
+            kcc20_template: h,
+            amount: next_amount,
+            owner: owner,
+            owner_scheme: OWNER_COVENANT_ID,
+            borrow_scheme: BORROW_DISABLED,
+            borrow_guard: v.borrow_guard,
+            extension_commitment: v.extension_commitment
+        };
+        validateOutputStateWithInputTemplate(out_idx, nv, vidx, pl, sl, h);
+        require(OpOutputCovenantId(out_idx) == token);
+        require(tx.outputs[out_idx].value >= tx.inputs[vidx].value);
+    }
+
+    #[covenant(binding = auth, from = 1, to = 1, groups = single)]
+    function deposit(
+        State prev,
+        State[] newStates,
+        int next_reserve_token,
+        int next_lp_vault,
+        int next_lp_supply,
+        int token_vault_out,
+        int lp_vault_out
+    ) {
+        require(newStates.length == 1);
+        require(newStates[0].amm_id == prev.amm_id);
+
+        // This module keeps at least its dust.
+        require(tx.outputs[OpAuthOutputIdx(this.activeInputIndex, 0)].value
+            >= tx.inputs[this.activeInputIndex].value);
+
+        // ── The AMM of this pool, which must designate us ──
+        require(OpCovInputCount(prev.amm_id) == 1);
+        require(OpCovOutputCount(prev.amm_id) == 1);
+        int amm_in = OpCovInputIdx(prev.amm_id, 0);
+        AmmState a = readInputStateWithTemplate(amm_in, amm_prefix_len, amm_suffix_len, amm_hash);
+        require(a.initialized);
+        require(a.deposit_id == OpInputCovenantId(this.activeInputIndex));
+        require(OpCovInputCount(a.withdraw_id) == 0);
+
+        // ── AMM output state: only the accounting changes ──
+        validateOutputStateWithInputTemplate(
+            OpCovOutputIdx(prev.amm_id, 0),
+            AmmState {
+                initialized: a.initialized,
+                token_id: a.token_id,
+                lp_token_id: a.lp_token_id,
+                kas_pool_id: a.kas_pool_id,
+                deposit_id: a.deposit_id,
+                withdraw_id: a.withdraw_id,
+                modules_hash: a.modules_hash,
+                token_prefix_len: a.token_prefix_len,
+                token_suffix_len: a.token_suffix_len,
+                token_hash: a.token_hash,
+                reserve_token: next_reserve_token,
+                lp_vault: next_lp_vault,
+                lp_supply: next_lp_supply
+            },
+            amm_in,
+            amm_prefix_len,
+            amm_suffix_len,
+            amm_hash
+        );
+
+        // ── Both vaults: identity + continuation ──
+        checkVault(
+            a.token_id, prev.amm_id, a.token_prefix_len, a.token_suffix_len, a.token_hash,
+            a.reserve_token, next_reserve_token, token_vault_out
+        );
+        checkVault(
+            a.lp_token_id, prev.amm_id, lp_prefix_len, lp_suffix_len, lp_hash,
+            a.lp_vault, next_lp_vault, lp_vault_out
+        );
+
+        // ── KAS reserve ──
+        require(OpCovInputCount(a.kas_pool_id) == 1);
+        require(OpCovOutputCount(a.kas_pool_id) == 1);
+        int k_in = tx.inputs[OpCovInputIdx(a.kas_pool_id, 0)].value;
+        int k_out = tx.outputs[OpCovOutputIdx(a.kas_pool_id, 0)].value;
+
+        // ── Formula ──
+        int dk = k_out - k_in;
+        int dt = next_reserve_token - a.reserve_token;
+        int dl = a.lp_vault - next_lp_vault;
+        require(dk > 0);
+        require(dt > 0);
+        require(dl > 0);
+
+        if (a.lp_supply == 0) {
+            int minted = dl + MIN_LIQUIDITY;
+            requireMulLe(minted, minted, dk, dt);
+            require(next_lp_supply == minted);
+        } else {
+            requireMulLe(dl, k_in, dk, a.lp_supply);
+            requireMulLe(dl, a.reserve_token, dt, a.lp_supply);
+            require(next_lp_supply == a.lp_supply + dl);
+        }
+    }
+}
